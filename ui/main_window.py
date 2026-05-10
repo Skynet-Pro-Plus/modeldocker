@@ -50,6 +50,7 @@ from session_title_parse import (
     StreamingSessionTitleParser,
     split_first_turn_response,
 )
+from memory_store import MemoryStore
 from role_store import DEFAULT_ROLE_ID, Role, RoleStore
 from session_store import (
     DEFAULT_SYSTEM_PROMPT,
@@ -61,7 +62,7 @@ from settings_store import DEFAULT_MODEL_ID, SettingsStore
 from shiboken6 import isValid
 from ui.composer import Composer
 from ui.conversation_view import ConversationView, MessageBubble
-from ui.dialogs import ApiKeyDialog, HistoryDialog, RoleManagerDialog
+from ui.dialogs import ApiKeyDialog, HistoryDialog, MemoryManagerDialog, RoleManagerDialog
 from ui.sidebar import Sidebar
 from ui.theme import Theme, ThemeManager, build_stylesheet
 from ui.title_bar import TitleBar
@@ -260,6 +261,7 @@ class ModelDockerMainWindow(QMainWindow):
         self.settings = SettingsStore()
         self.session_store = SessionStore()
         self.role_store = RoleStore()
+        self.memory_store = MemoryStore()
         self.client: Optional[OpenRouterClient] = None
         self.models: List[ModelInfo] = []
         self.pending_attachments: List[PendingAttachment] = []
@@ -288,6 +290,10 @@ class ModelDockerMainWindow(QMainWindow):
         self._stream_assistant_label = ""
         self._stream_title_parser: Optional[StreamingSessionTitleParser] = None
         self._stream_first_turn_ai_title = False
+
+        # Retry-once context for transient provider errors. Holds the most
+        # recent send so we can silently re-run it before showing an error.
+        self._pending_retry: Optional[Dict[str, Any]] = None
 
         self.generated_image_dir = Path.home() / ".modeldocker" / "generated_images"
         self.generated_image_dir.mkdir(parents=True, exist_ok=True)
@@ -388,6 +394,8 @@ class ModelDockerMainWindow(QMainWindow):
         # Sidebar
         self.sidebar.connect_clicked.connect(self._prompt_for_api_key)
         self.sidebar.manage_role_clicked.connect(self._open_role_manager)
+        self.sidebar.memory_toggle_changed.connect(self._on_memory_toggle_changed)
+        self.sidebar.manage_memory_clicked.connect(self._open_memory_manager)
 
         # Composer
         self.composer.send_requested.connect(self._send_message)
@@ -529,6 +537,7 @@ class ModelDockerMainWindow(QMainWindow):
         self.sidebar.set_usage(self.session.total_prompt_tokens, self.session.total_completion_tokens)
         total_tokens = self.session.total_prompt_tokens + self.session.total_completion_tokens
         self.composer.set_total_tokens(total_tokens)
+        self._refresh_memory_sidebar()
         self.conversation.clear()
         for message in self.session.messages:
             self._render_message_into_ui(message, save=False)
@@ -648,6 +657,7 @@ class ModelDockerMainWindow(QMainWindow):
         self._sync_composer_model_selection()
         self._refresh_role_save_button()
         self._schedule_save()
+        self._refresh_memory_sidebar()
 
     def _activate_role(self, role_id: str) -> None:
         self.session.role_id = role_id
@@ -660,6 +670,7 @@ class ModelDockerMainWindow(QMainWindow):
         self._sync_composer_model_selection()
         self._refresh_role_save_button()
         self._schedule_save()
+        self._refresh_memory_sidebar()
 
     def _active_role(self) -> Role:
         role = self.role_store.get(self.session.role_id)
@@ -670,6 +681,41 @@ class ModelDockerMainWindow(QMainWindow):
 
     def _sync_session_prompt_from_role(self) -> None:
         self.session.system_prompt = self._active_role().prompt or DEFAULT_SYSTEM_PROMPT
+
+    def _refresh_memory_sidebar(self) -> None:
+        injection = self.settings.load_memory_enabled()
+        count = self.memory_store.count_active_for_role(self.session.role_id)
+        self.sidebar.set_memory_sidebar(injection_enabled=injection, active_count=count)
+
+    def _on_memory_toggle_changed(self, checked: bool) -> None:
+        self.settings.save_memory_enabled(bool(checked))
+        self._refresh_memory_sidebar()
+
+    def _open_memory_manager(self) -> None:
+        dialog = MemoryManagerDialog(
+            self.memory_store,
+            self.role_store,
+            self.session.role_id,
+            self,
+        )
+        dialog.exec()
+        self._refresh_memory_sidebar()
+
+    def _memory_extra_system(self) -> str:
+        if not self.settings.load_memory_enabled():
+            return ""
+        return self.memory_store.format_for_prompt(self.session.role_id)
+
+    def _compose_extra_system(self, use_ai_session_title: bool) -> str:
+        parts: List[str] = []
+        if use_ai_session_title:
+            extra = FIRST_TURN_SESSION_TITLE_EXTRA_SYSTEM.strip()
+            if extra:
+                parts.append(extra)
+        mem = self._memory_extra_system().strip()
+        if mem:
+            parts.append(mem)
+        return "\n\n".join(parts)
 
     def _on_temperature_changed(self, value: float) -> None:
         self.session.temperature = float(value)
@@ -1266,7 +1312,7 @@ class ModelDockerMainWindow(QMainWindow):
         request_messages = build_request_messages(
             self._messages_for_request(),
             self.session.system_prompt,
-            extra_system=FIRST_TURN_SESSION_TITLE_EXTRA_SYSTEM if use_ai_session_title else "",
+            extra_system=self._compose_extra_system(use_ai_session_title),
         )
         temperature = self.session.temperature if model.supports_temperature else None
 
@@ -1289,6 +1335,14 @@ class ModelDockerMainWindow(QMainWindow):
         if self.composer.is_image_output_requested():
             self.sidebar.set_status("Generating image...", "Waiting for model response.", level="info")
             max_tokens = self.settings.effective_max_output_tokens() if model.supports_max_tokens else None
+            self._pending_retry = {
+                "kind": "image",
+                "model": model,
+                "request_messages": request_messages,
+                "temperature": temperature,
+                "max_tokens": max_tokens,
+                "attempted": False,
+            }
             self._run_worker(
                 self.client.generate_image,
                 model.model_id,
@@ -1304,6 +1358,15 @@ class ModelDockerMainWindow(QMainWindow):
 
         self.sidebar.set_status("Streaming response...", "Receiving tokens.", level="info")
         self._stream_first_turn_ai_title = use_ai_session_title
+        self._pending_retry = {
+            "kind": "stream",
+            "model": model,
+            "request_messages": request_messages,
+            "modalities": None,
+            "temperature": temperature,
+            "use_ai_session_title": use_ai_session_title,
+            "attempted": False,
+        }
         self._begin_streaming_response(model)
         self._run_stream_worker(model, request_messages, None, temperature)
 
@@ -1374,6 +1437,10 @@ class ModelDockerMainWindow(QMainWindow):
         event_type = event.get("type")
         if event_type == "text":
             content = str(event.get("content", ""))
+            # First real token after a retry: clear the "Retrying provider..." hint.
+            if not self.stream_text and self.stream_edit is not None and isValid(self.stream_edit):
+                if self.stream_edit.toPlainText() == "Retrying provider...":
+                    self.stream_edit.setPlainText("")
             self.stream_text += content
             if self._stream_title_parser is not None:
                 visible = self._stream_title_parser.feed(content)
@@ -1397,6 +1464,7 @@ class ModelDockerMainWindow(QMainWindow):
                     self.stream_images.append(str(image_url["url"]))
 
     def _on_stream_finished(self, model: ModelInfo) -> None:
+        self._pending_retry = None
         self.composer.set_send_enabled(True)
         used_title_parse = self._stream_first_turn_ai_title
         self._stream_first_turn_ai_title = False
@@ -1454,6 +1522,7 @@ class ModelDockerMainWindow(QMainWindow):
         self._schedule_save()
 
     def _on_image_generation_response(self, model: ModelInfo, response: Dict[str, Any]) -> None:
+        self._pending_retry = None
         self.composer.set_send_enabled(True)
         image_urls = extract_image_urls(response)
         message = response.get("choices", [{}])[0].get("message", {})
@@ -1587,25 +1656,138 @@ class ModelDockerMainWindow(QMainWindow):
         )
 
     def _on_chat_error(self, error_text: str) -> None:
-        self.composer.set_send_enabled(True)
+        # Try one silent retry on transient provider errors (e.g. the
+        # OpenRouter Free Models Router routing to a flaky free provider).
+        try:
+            if self._maybe_retry_after_error(error_text):
+                return
+        except Exception:
+            # Defensive: never let retry plumbing strand the send button.
+            pass
+
+        self._pending_retry = None
         message = self._pretty_error(error_text)
-        failed_bubble = self.stream_bubble
-        if self.stream_edit is not None and not self.stream_text.strip():
-            self.stream_edit.setPlainText("(request failed)")
-        self.stream_text = ""
-        self.stream_started_at = 0.0
-        self.stream_edit = None
-        self.stream_bubble = None
-        self.stream_model = None
-        self._stream_assistant_label = ""
-        self._stream_title_parser = None
-        self._stream_first_turn_ai_title = False
-        if failed_bubble is not None and isValid(failed_bubble):
-            failed_bubble.set_speak_enabled(True)
-        self.sidebar.set_status("Request failed", message, level="error")
-        bubble = self.conversation.add_bubble("system", uuid.uuid4().hex)
-        bubble.add_text(f"Error: {message}")
-        QMessageBox.critical(self, "Request failed", message)
+        try:
+            failed_bubble = self.stream_bubble
+            if self.stream_edit is not None and isValid(self.stream_edit):
+                if not self.stream_text.strip():
+                    self.stream_edit.setPlainText(f"(request failed: {message[:160]})")
+            self.stream_text = ""
+            self.stream_started_at = 0.0
+            self.stream_edit = None
+            self.stream_bubble = None
+            self.stream_model = None
+            self._stream_assistant_label = ""
+            self._stream_title_parser = None
+            self._stream_first_turn_ai_title = False
+            if failed_bubble is not None and isValid(failed_bubble):
+                failed_bubble.set_speak_enabled(True)
+            self.sidebar.set_status("Request failed", message, level="error")
+            bubble = self.conversation.add_bubble("system", uuid.uuid4().hex)
+            bubble.add_text(
+                "Error: "
+                f"{message}\n\n"
+                "Tip: the Free Models Router rotates between free providers; "
+                "some refuse some prompts. Try again or pick a specific model."
+            )
+        finally:
+            # Always re-enable Send so a transient error can never lock the UI.
+            self.composer.set_send_enabled(True)
+
+    @staticmethod
+    def _is_transient_provider_error(error_text: str) -> bool:
+        """Heuristic: errors worth retrying once silently (router/provider hiccups)."""
+        text = (error_text or "").lower()
+        # Don't retry credential / quota / payload problems.
+        if "401" in text or "403" in text:
+            return False
+        if "insufficient" in text or "requires more credits" in text:
+            return False
+        if "fewer max_tokens" in text or "context length" in text:
+            return False
+        if "invalid api key" in text or "no auth" in text:
+            return False
+        signals = (
+            "provider returned error",
+            "provider error",
+            "no instances available",
+            "upstream",
+            "rate limit",
+            "too many requests",
+            "timeout",
+            "timed out",
+            "temporarily unavailable",
+            "service unavailable",
+            "bad gateway",
+            "gateway time-out",
+            "overloaded",
+            "stream error",
+            "stream timed out",
+            "unable to reach",
+            "unable to stream",
+            "502",
+            "503",
+            "504",
+            "529",
+        )
+        return any(token in text for token in signals)
+
+    def _maybe_retry_after_error(self, error_text: str) -> bool:
+        info = self._pending_retry
+        if not info or info.get("attempted"):
+            return False
+        if not self._is_transient_provider_error(error_text):
+            return False
+
+        info["attempted"] = True
+        kind = info.get("kind")
+        model: ModelInfo = info["model"]
+        message = self._pretty_error(error_text)
+        self.sidebar.set_status(
+            "Retrying...",
+            f"Provider hiccup, retrying once. ({message[:80]})",
+            level="warn",
+        )
+
+        if kind == "stream":
+            # Reuse the existing assistant bubble and replace the partial text
+            # with a visible "retrying" hint so the user sees activity.
+            if self.stream_edit is not None and isValid(self.stream_edit):
+                self.stream_edit.setPlainText("Retrying provider...")
+            self.stream_text = ""
+            self.stream_usage = {}
+            self.stream_images = []
+            self.stream_started_at = time.monotonic()
+            if info.get("use_ai_session_title"):
+                self._stream_title_parser = StreamingSessionTitleParser()
+                self._stream_first_turn_ai_title = True
+            else:
+                self._stream_title_parser = None
+                self._stream_first_turn_ai_title = False
+            self._run_stream_worker(
+                model,
+                info["request_messages"],
+                info.get("modalities"),
+                info.get("temperature"),
+            )
+            return True
+
+        if kind == "image":
+            if not self.client:
+                return False
+            self._run_worker(
+                self.client.generate_image,
+                model.model_id,
+                info["request_messages"],
+                model.supports_image_output,
+                info.get("temperature"),
+                info.get("max_tokens"),
+                on_result=lambda data: self._on_image_generation_response(model, data),
+                on_error=self._on_chat_error,
+            )
+            return True
+
+        return False
 
     def _refresh_balance_async(self) -> None:
         if not self.client:

@@ -2,6 +2,7 @@ import tempfile
 from pathlib import Path
 from unittest.mock import MagicMock
 
+from memory_store import MAX_MEMORIES_IN_PROMPT, Memory, MemoryStore
 from openrouter_client import (
     ModelInfo,
     OpenRouterClient,
@@ -55,6 +56,35 @@ def test_sort_models() -> None:
     ]
     sorted_models = sort_models(models)
     assert [m.company for m in sorted_models] == ["Anthropic", "Google", "Openai"]
+
+
+def test_sort_models_modes() -> None:
+    models = [
+        ModelInfo("zeta/new", "New", "Zeta", raw={"created": 1735689600}),
+        ModelInfo("alpha/old", "Old", "Alpha", raw={"created": 1704067200}),
+        ModelInfo("beta/unknown", "Unknown", "Beta"),
+    ]
+
+    assert [m.model_id for m in sort_models(models, "name_az")] == [
+        "alpha/old",
+        "beta/unknown",
+        "zeta/new",
+    ]
+    assert [m.model_id for m in sort_models(models, "name_za")] == [
+        "zeta/new",
+        "beta/unknown",
+        "alpha/old",
+    ]
+    assert [m.model_id for m in sort_models(models, "newest")] == [
+        "zeta/new",
+        "alpha/old",
+        "beta/unknown",
+    ]
+    assert [m.model_id for m in sort_models(models, "oldest")] == [
+        "alpha/old",
+        "zeta/new",
+        "beta/unknown",
+    ]
 
 
 def test_cost_calculation() -> None:
@@ -671,8 +701,93 @@ def test_get_generation_uses_quoted_id() -> None:
     assert "gen%2Fa%2Bb" in captured[0] or "gen%2fa%2bb" in captured[0].lower()
 
 
+def test_memory_store_round_trip() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / "memories.json"
+        store = MemoryStore(path)
+        mem = Memory(
+            id="",
+            text="  Prefer dark mode  ",
+            role_id=None,
+            enabled=True,
+            created_at=0.0,
+            updated_at=0.0,
+        )
+        store.upsert(mem)
+        store2 = MemoryStore(path)
+        loaded = store2.get(mem.id)
+        assert loaded is not None
+        assert loaded.text == "Prefer dark mode"
+
+
+def test_memory_role_scoping_and_disabled() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / "mem.json"
+        store = MemoryStore(path)
+        store.upsert(
+            Memory(id="g", text="global", role_id=None, enabled=True, created_at=0, updated_at=0)
+        )
+        store.upsert(
+            Memory(
+                id="c",
+                text="car only",
+                role_id=CAR_MECHANIC_ROLE_ID,
+                enabled=True,
+                created_at=0,
+                updated_at=0,
+            )
+        )
+        store.upsert(
+            Memory(id="h", text="hidden", role_id=None, enabled=False, created_at=0, updated_at=0)
+        )
+
+        txt_default = store.format_for_prompt(DEFAULT_ROLE_ID)
+        assert "global" in txt_default
+        assert "car only" not in txt_default
+        assert "hidden" not in txt_default
+
+        txt_car = store.format_for_prompt(CAR_MECHANIC_ROLE_ID)
+        assert "global" in txt_car
+        assert "car only" in txt_car
+
+
+def test_memory_format_respects_limit() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / "mem.json"
+        store = MemoryStore(path)
+        for i in range(MAX_MEMORIES_IN_PROMPT + 3):
+            store.upsert(
+                Memory(
+                    id="",
+                    text=f"entry-{i}",
+                    role_id=None,
+                    enabled=True,
+                    created_at=0,
+                    updated_at=0,
+                )
+            )
+        blob = store.format_for_prompt(DEFAULT_ROLE_ID, limit=MAX_MEMORIES_IN_PROMPT)
+        assert blob.count("- ") == MAX_MEMORIES_IN_PROMPT
+        bullet_lines = [ln for ln in blob.splitlines() if ln.strip().startswith("- ")]
+        assert len(bullet_lines) == MAX_MEMORIES_IN_PROMPT
+
+
+def test_build_request_messages_combines_memory_style_extra() -> None:
+    extra = (
+        "First extra block\n\n"
+        "Relevant saved memory:\n"
+        "- Fact one\n\n"
+        "Use these memories only when relevant."
+    )
+    msgs = build_request_messages([{"role": "user", "content": "hi"}], "SYS", extra_system=extra)
+    assert msgs[0]["role"] == "system"
+    assert "SYS" in msgs[0]["content"]
+    assert "Fact one" in msgs[0]["content"]
+
+
 if __name__ == "__main__":
     test_sort_models()
+    test_sort_models_modes()
     test_cost_calculation()
     test_modality_labels_and_upload_gating()
     test_image_output_does_not_enable_image_upload()
@@ -698,4 +813,8 @@ if __name__ == "__main__":
     test_create_speech_request_shape()
     test_generation_total_cost_parses_payload()
     test_get_generation_uses_quoted_id()
+    test_memory_store_round_trip()
+    test_memory_role_scoping_and_disabled()
+    test_memory_format_respects_limit()
+    test_build_request_messages_combines_memory_style_extra()
     print("Smoke tests passed.")

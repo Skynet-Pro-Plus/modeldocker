@@ -4,6 +4,7 @@ from typing import Optional
 
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import (
+    QCheckBox,
     QFrame,
     QGridLayout,
     QHBoxLayout,
@@ -50,6 +51,8 @@ class Sidebar(QScrollArea):
 
     connect_clicked = Signal()
     manage_role_clicked = Signal()
+    memory_toggle_changed = Signal(bool)
+    manage_memory_clicked = Signal()
 
     def __init__(self, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
@@ -66,6 +69,7 @@ class Sidebar(QScrollArea):
 
         layout.addWidget(self._build_api_card())
         layout.addWidget(self._build_system_prompt_card())
+        layout.addWidget(self._build_memory_card())
         layout.addWidget(self._build_usage_card())
         layout.addWidget(self._build_capabilities_card())
         layout.addWidget(self._build_status_card())
@@ -108,6 +112,30 @@ class Sidebar(QScrollArea):
         self.role_button.setToolTip("Manage roles (system prompts)")
         self.role_button.clicked.connect(self.manage_role_clicked.emit)
         card.add_widget(self.role_button)
+        return card
+
+    def _build_memory_card(self) -> Card:
+        card = Card("Memory", icon="\U0001F9E0")
+        self.memory_toggle = QCheckBox("Include saved memory in prompts")
+        self.memory_toggle.setChecked(True)
+        self.memory_toggle.setToolTip(
+            "When enabled, active memories are added to the model request as context."
+        )
+        self.memory_toggle.toggled.connect(self.memory_toggle_changed.emit)
+
+        self.memory_summary = QLabel("Active for this role: 0")
+        self.memory_summary.setObjectName("mutedLabel")
+        self.memory_summary.setWordWrap(True)
+
+        self.manage_memory_btn = QPushButton("Manage memories...")
+        self.manage_memory_btn.setObjectName("ghostButton")
+        self.manage_memory_btn.setMinimumHeight(32)
+        self.manage_memory_btn.setToolTip("Add, edit, or remove saved memories")
+        self.manage_memory_btn.clicked.connect(self.manage_memory_clicked.emit)
+
+        card.add_widget(self.memory_toggle)
+        card.add_widget(self.memory_summary)
+        card.add_widget(self.manage_memory_btn)
         return card
 
     def _build_usage_card(self) -> Card:
@@ -185,6 +213,15 @@ class Sidebar(QScrollArea):
         if len(cleaned) > 32:
             cleaned = cleaned[:32] + "..."
         self.role_button.setText(f"Role: {cleaned}    \u203A")
+
+    def set_memory_sidebar(self, *, injection_enabled: bool, active_count: int) -> None:
+        self.memory_toggle.blockSignals(True)
+        self.memory_toggle.setChecked(injection_enabled)
+        self.memory_toggle.blockSignals(False)
+        if injection_enabled:
+            self.memory_summary.setText(f"Active for this role: {active_count}")
+        else:
+            self.memory_summary.setText("Memory off (not sent to the model)")
 
     def set_balance(self, remaining_text: str) -> None:
         self.balance_row.set_value(remaining_text)

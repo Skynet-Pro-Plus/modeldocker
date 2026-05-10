@@ -140,6 +140,10 @@ class ModelInfo:
         return f"Released {date}" if (date := _release_date(self.raw, self.video_metadata)) else "Released unknown"
 
     @property
+    def release_timestamp(self) -> Optional[int]:
+        return _release_timestamp(self.raw, self.video_metadata)
+
+    @property
     def video_pricing_label(self) -> str:
         return _video_pricing_label(self.video_metadata)
 
@@ -252,6 +256,13 @@ def _int_values(value: Any) -> List[int]:
 
 
 def _release_date(*sources: Dict[str, Any]) -> str:
+    timestamp = _release_timestamp(*sources)
+    if timestamp is None:
+        return ""
+    return datetime.fromtimestamp(timestamp, tz=timezone.utc).strftime("%Y-%m-%d")
+
+
+def _release_timestamp(*sources: Dict[str, Any]) -> Optional[int]:
     for source in sources:
         value = source.get("created")
         try:
@@ -260,8 +271,8 @@ def _release_date(*sources: Dict[str, Any]) -> str:
             continue
         if timestamp <= 0:
             continue
-        return datetime.fromtimestamp(timestamp, tz=timezone.utc).strftime("%Y-%m-%d")
-    return ""
+        return timestamp
+    return None
 
 
 def _modality_icon_label(modalities: List[str]) -> str:
@@ -332,11 +343,32 @@ def _video_price_unit(sku: str) -> str:
     return f"{unit} ({', '.join(details)})" if details else unit
 
 
-def sort_models(models: List[ModelInfo]) -> List[ModelInfo]:
-    return sorted(
-        models,
-        key=lambda m: (m.company.lower(), m.name.lower(), m.model_id.lower()),
-    )
+def _name_sort_key(model: ModelInfo) -> Tuple[str, str, str]:
+    return (model.company.lower(), model.name.lower(), model.model_id.lower())
+
+
+def sort_models(models: List[ModelInfo], mode: str = "name_az") -> List[ModelInfo]:
+    if mode == "name_za":
+        return sorted(models, key=_name_sort_key, reverse=True)
+    if mode == "newest":
+        return sorted(
+            models,
+            key=lambda m: (
+                m.release_timestamp is None,
+                -(m.release_timestamp or 0),
+                *_name_sort_key(m),
+            ),
+        )
+    if mode == "oldest":
+        return sorted(
+            models,
+            key=lambda m: (
+                m.release_timestamp is None,
+                m.release_timestamp or 0,
+                *_name_sort_key(m),
+            ),
+        )
+    return sorted(models, key=_name_sort_key)
 
 
 def calculate_interaction_cost(

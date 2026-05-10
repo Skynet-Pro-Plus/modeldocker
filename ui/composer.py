@@ -22,7 +22,7 @@ from PySide6.QtWidgets import (
     QWidgetAction,
 )
 
-from openrouter_client import ModelInfo
+from openrouter_client import ModelInfo, sort_models
 from ui.widgets.icon_button import IconButton
 from ui.widgets.pill import Pill
 
@@ -100,6 +100,7 @@ class Composer(QFrame):
         self.setObjectName("composer")
         self._models: List[ModelInfo] = []
         self._filter_actions: Dict[str, QAction] = {}
+        self._sort_mode = "name_az"
 
         outer = QVBoxLayout(self)
         outer.setContentsMargins(14, 12, 14, 12)
@@ -145,6 +146,16 @@ class Composer(QFrame):
         self.gear_btn.setMenu(self._gear_menu)
         self.gear_btn.setFixedSize(34, 32)
 
+        self.sort_combo = QComboBox()
+        self.sort_combo.setToolTip("Sort the filtered model list")
+        # Pass userData positionally so all Qt/PySide builds store it reliably.
+        self.sort_combo.addItem("A-Z", "name_az")
+        self.sort_combo.addItem("Z-A", "name_za")
+        self.sort_combo.addItem("Newest", "newest")
+        self.sort_combo.addItem("Oldest", "oldest")
+        self.sort_combo.currentIndexChanged.connect(self._on_sort_changed)
+        self.sort_combo.setMinimumWidth(92)
+
         self.model_combo = QComboBox()
         self.model_combo.setMinimumWidth(220)
         self.model_combo.currentIndexChanged.connect(self._on_model_index_changed)
@@ -184,6 +195,7 @@ class Composer(QFrame):
         row.addWidget(self.search_edit, 0)
         row.addWidget(self.match_count_pill)
         row.addWidget(self.gear_btn)
+        row.addWidget(self.sort_combo)
         row.addWidget(model_pick_shell, 1)
         row.addWidget(self.in_price_pill)
         row.addWidget(self.out_price_pill)
@@ -278,6 +290,23 @@ class Composer(QFrame):
         """Expand the model dropdown when the user explicitly asks (Enter / Down)."""
         if self._models:
             self.model_combo.showPopup()
+
+    def _sort_mode_from_combo(self) -> str:
+        idx = self.sort_combo.currentIndex()
+        if idx < 0:
+            return "name_az"
+        raw = self.sort_combo.itemData(idx, Qt.ItemDataRole.UserRole)
+        if raw is None:
+            raw = self.sort_combo.currentData(Qt.ItemDataRole.UserRole)
+        if raw is None:
+            return "name_az"
+        return str(raw)
+
+    def _on_sort_changed(self, _index: int) -> None:
+        self._sort_mode = self._sort_mode_from_combo()
+        # Close model dropdown so Qt repaints the list (popup can show stale order).
+        self.model_combo.hidePopup()
+        self.refresh_combo()
 
     def _filters_active(self) -> bool:
         if self.search_text():
@@ -433,6 +462,8 @@ class Composer(QFrame):
 
     def refresh_combo(self) -> None:
         previous_id = self.selected_model_id()
+        # Keep sort mode in sync if combo data was restored oddly.
+        self._sort_mode = self._sort_mode_from_combo()
         filtered = self._filter_models()
         filtered_ids = {m.model_id for m in filtered}
         self._update_match_count_pill(matched=len(filtered), total=len(self._models))
@@ -446,6 +477,7 @@ class Composer(QFrame):
             if pinned_model is not None:
                 pinned.append(pinned_model)
 
+        self.model_combo.hidePopup()
         self.model_combo.blockSignals(True)
         self.model_combo.clear()
         for model in pinned:
@@ -481,7 +513,7 @@ class Composer(QFrame):
             if required and not all(self._model_matches_filter(model, key) for key in required):
                 continue
             results.append(model)
-        return results
+        return sort_models(results, self._sort_mode)
 
     @staticmethod
     def _model_matches_filter(model: ModelInfo, key: str) -> bool:

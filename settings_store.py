@@ -111,6 +111,23 @@ class SettingsStore:
     def save_theme(self, theme: str) -> None:
         self.set_pref("theme", theme)
 
+    def load_memory_enabled(self) -> bool:
+        """When True, enabled memories are injected into chat requests."""
+        raw = self.get_pref("memory_enabled", True)
+        if raw is None:
+            return True
+        if isinstance(raw, bool):
+            return raw
+        if isinstance(raw, (int, float)):
+            return bool(raw)
+        text = str(raw).strip().lower()
+        if text in {"0", "false", "no", "off"}:
+            return False
+        return True
+
+    def save_memory_enabled(self, enabled: bool) -> None:
+        self.set_pref("memory_enabled", bool(enabled))
+
     def load_last_session_id(self) -> Optional[str]:
         value = self.get_pref("last_session_id")
         return str(value) if value else None
