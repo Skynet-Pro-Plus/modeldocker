@@ -1,0 +1,45 @@
+# Byte-compiled / cache
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyo
+
+# Virtual environments
+.venv/
+venv/
+ENV/
+env/
+
+# Environment / secrets (never commit keys)
+.env
+.env.*
+
+# PyInstaller — generated intermediates (keep repo clean)
+build/
+
+# Distribution folder — ignore everything except the shipped Windows exe
+dist/*
+!dist/ModelDocker.exe
+
+# IDE / editors
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Testing / type-check caches
+.pytest_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+
+# Duplicate / scratch output folders (optional local builds)
+dist_md2/
+
+# Editor / backup files
+*.bak
+
+# OS
+Thumbs.db
+Desktop.ini
+.DS_Store

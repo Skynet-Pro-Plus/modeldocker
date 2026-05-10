@@ -1,0 +1,5 @@
+# Optional — only needed to produce dist/ModelDocker.exe
+pyinstaller>=6.0
+# Optional — regenerate resources/ModelDocker.ico from resources/ModelDocker.png;
+# also used by scripts/normalize_icon.py when repairing ICON.ico
+pillow>=10.0
