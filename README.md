@@ -4,7 +4,11 @@
 
 ModelDocker gives you a clean local desktop interface for chatting with OpenRouter models, managing conversations, switching themes, and working with model capabilities from one app.
 
-![ModelDocker screenshot](Modeldocker.jpg)
+![ModelDocker banner](Modeldocker.jpg)
+
+## Screenshot
+
+![ModelDocker desktop app screenshot](screenshot.jpg)
 
 ## Download
 
